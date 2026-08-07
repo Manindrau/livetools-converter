@@ -5,6 +5,7 @@ RUN apt-get update && apt-get install -y \
     libreoffice-writer \
     libreoffice-calc \
     libreoffice-impress \
+    libreoffice-pdfimport \
     fonts-liberation \
     fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
