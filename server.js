@@ -73,15 +73,14 @@ app.post('/convert/pdf-to-word', upload.single('file'), async (req, res) => {
       return res.status(400).json({ error: 'No file uploaded' });
     }
 
-    const inputPath = req.file.path;
+    const inputPath = req.file.path + '.pdf';
+    fs.renameSync(req.file.path, inputPath);
     const outputPath = `/tmp/output_${uuidv4()}.docx`;
 
     const inputBuffer = fs.readFileSync(inputPath);
 
     libre.convert(inputBuffer, '.docx', undefined, (err, result) => {
-      if (inputPath && fs.existsSync(inputPath)) {
-        fs.unlinkSync(inputPath);
-      }
+      if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
 
       if (err) {
         console.error('Conversion error:', err);
