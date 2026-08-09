@@ -152,6 +152,7 @@ app.post('/compress-pdf', upload.single('file'), async (req, res) => {
     }
 
     const targetSizeKB = parseInt(req.body.targetSize) || 500;
+    const targetBytes = targetSizeKB * 1024;
     inputDir = '/tmp/compress_' + uuidv4();
     fs.mkdirSync(inputDir, { recursive: true });
     const inputPath = path.join(inputDir, 'input.pdf');
@@ -159,18 +160,52 @@ app.post('/compress-pdf', upload.single('file'), async (req, res) => {
     
     fs.renameSync(req.file.path, inputPath);
 
-    let quality = '/ebook';
-    if (targetSizeKB <= 100) quality = '/screen';
-    else if (targetSizeKB <= 200) quality = '/screen';
-    else if (targetSizeKB <= 500) quality = '/ebook';
-    else quality = '/printer';
+    const originalSize = fs.statSync(inputPath).size;
 
-    const cmd = `gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=${quality} -dNOPAUSE -dBATCH -dQUIET -sOutputFile="${outputPath}" "${inputPath}"`;
-    
-    execSync(cmd, { timeout: 60000 });
+    if (originalSize <= targetBytes) {
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="compressed.pdf"`);
+      fs.createReadStream(inputPath).pipe(res);
+      res.on('finish', () => { if (inputDir) fs.rmSync(inputDir, { recursive: true, force: true }); });
+      return;
+    }
 
-    if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size === 0) {
-      throw new Error('Ghostscript produced empty output');
+    const resolutions = [200, 150, 100, 72, 50, 30];
+    let bestPath = null;
+    let bestSize = Infinity;
+
+    for (const dpi of resolutions) {
+      const attemptOutput = path.join(inputDir, 'attempt_' + dpi + '.pdf');
+      const cmd = `gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dNOPAUSE -dBATCH -dQUIET ` +
+        `-dDownsampleColorImages=true -dDownsampleGrayImages=true -dDownsampleMonoImages=true ` +
+        `-dColorImageResolution=${dpi} -dGrayImageResolution=${dpi} -dMonoImageResolution=${dpi} ` +
+        `-dAutoFilterColorImages=false -dColorImageDownsampleType=/Bicubic ` +
+        `-sOutputFile="${attemptOutput}" "${inputPath}"`;
+      
+      try {
+        execSync(cmd, { timeout: 60000 });
+      } catch (e) {
+        continue;
+      }
+
+      if (!fs.existsSync(attemptOutput)) continue;
+
+      const attemptSize = fs.statSync(attemptOutput).size;
+
+      if (attemptSize < bestSize) {
+        bestSize = attemptSize;
+        bestPath = attemptOutput;
+      }
+
+      if (attemptSize <= targetBytes) break;
+    }
+
+    if (!bestPath) {
+      throw new Error('Compression failed');
+    }
+
+    if (bestPath !== outputPath) {
+      fs.copyFileSync(bestPath, outputPath);
     }
 
     res.setHeader('Content-Type', 'application/pdf');
