@@ -145,13 +145,14 @@ app.post('/convert/ppt-to-pdf', upload.single('file'), async (req, res) => {
 });
 
 app.post('/compress-pdf', upload.single('file'), async (req, res) => {
+  let inputDir = null;
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' });
     }
 
     const targetSizeKB = parseInt(req.body.targetSize) || 500;
-    const inputDir = '/tmp/compress_' + uuidv4();
+    inputDir = '/tmp/compress_' + uuidv4();
     fs.mkdirSync(inputDir, { recursive: true });
     const inputPath = path.join(inputDir, 'input.pdf');
     const outputPath = path.join(inputDir, 'output.pdf');
@@ -168,6 +169,10 @@ app.post('/compress-pdf', upload.single('file'), async (req, res) => {
     
     execSync(cmd, { timeout: 60000 });
 
+    if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size === 0) {
+      throw new Error('Ghostscript produced empty output');
+    }
+
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="compressed.pdf"`);
 
@@ -175,11 +180,16 @@ app.post('/compress-pdf', upload.single('file'), async (req, res) => {
     fileStream.pipe(res);
 
     fileStream.on('end', () => {
-      fs.rmSync(inputDir, { recursive: true, force: true });
+      if (inputDir) fs.rmSync(inputDir, { recursive: true, force: true });
+    });
+
+    fileStream.on('error', () => {
+      if (inputDir) fs.rmSync(inputDir, { recursive: true, force: true });
     });
   } catch (error) {
     console.error('Compression error:', error);
     res.status(500).json({ error: 'Compression failed: ' + error.message });
+    if (inputDir) fs.rmSync(inputDir, { recursive: true, force: true });
   }
 });
 
