@@ -4,7 +4,10 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
-const { execSync } = require('child_process');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+
+const execFileAsync = promisify(execFile);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -17,215 +20,251 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 }
 });
 
+// --- minimal in-memory rate limiter (requests per IP per minute) ---
+const RATE_LIMIT = 60;
+const rateWindow = 60 * 1000;
+const rateHits = new Map();
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, rec] of rateHits) if (now > rec.reset) rateHits.delete(key);
+}, 60 * 1000).unref();
+
+function rateLimit(req, res, next) {
+  const now = Date.now();
+  const key = req.ip || 'unknown';
+  let rec = rateHits.get(key);
+  if (!rec || now > rec.reset) {
+    rec = { count: 0, reset: now + rateWindow };
+    rateHits.set(key, rec);
+  }
+  rec.count += 1;
+  if (rec.count > RATE_LIMIT) {
+    return res.status(429).json({ error: 'Too many requests. Please slow down.' });
+  }
+  next();
+}
+
+// --- concurrency queue: LibreOffice/gs jobs are heavy, cap at 2 at a time ---
+const MAX_CONCURRENT = 2;
+const jobQueue = [];
+let activeJobs = 0;
+
+function runLimited(fn) {
+  return new Promise((resolve, reject) => {
+    jobQueue.push({ fn, resolve, reject });
+    pumpQueue();
+  });
+}
+
+function pumpQueue() {
+  if (activeJobs >= MAX_CONCURRENT || jobQueue.length === 0) return;
+  const { fn, resolve, reject } = jobQueue.shift();
+  activeJobs += 1;
+  Promise.resolve()
+    .then(fn)
+    .then(resolve, reject)
+    .finally(() => {
+      activeJobs -= 1;
+      pumpQueue();
+    });
+}
+
+// --- helpers ---
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-function convertWithLibreOffice(inputPath, outputFormat) {
-  const outputDir = path.dirname(inputPath);
-  const cmd = `libreoffice --headless --convert-to ${outputFormat} --outdir "${outputDir}" "${inputPath}"`;
-  execSync(cmd, { timeout: 60000 });
-  const baseName = path.basename(inputPath, path.extname(inputPath));
-  return path.join(outputDir, baseName + '.' + outputFormat);
+function safeFilename(name, fallback) {
+  // strip anything that could break the Content-Disposition header
+  const cleaned = String(name || '')
+    .replace(/[\r\n"\\]/g, '')
+    .replace(/[^A-Za-z0-9._ -]/g, '_');
+  return cleaned.length > 0 ? cleaned : fallback;
 }
 
-app.post('/convert/word-to-pdf', upload.single('file'), async (req, res) => {
+function runLibreOffice(inputPath, outputFormat) {
+  const outputDir = path.dirname(inputPath);
+  return execFileAsync(
+    'libreoffice',
+    ['--headless', '--convert-to', outputFormat, '--outdir', outputDir, inputPath],
+    { timeout: 60000 }
+  ).then(() => {
+    const baseName = path.basename(inputPath, path.extname(inputPath));
+    return path.join(outputDir, baseName + '.' + outputFormat);
+  });
+}
+
+function runGhostscript(inputPath, outputPath, dpi) {
+  return execFileAsync(
+    'gs',
+    [
+      '-sDEVICE=pdfwrite',
+      '-dCompatibilityLevel=1.4',
+      '-dNOPAUSE',
+      '-dBATCH',
+      '-dQUIET',
+      '-dDownsampleColorImages=true',
+      '-dDownsampleGrayImages=true',
+      '-dDownsampleMonoImages=true',
+      `-dColorImageResolution=${dpi}`,
+      `-dGrayImageResolution=${dpi}`,
+      `-dMonoImageResolution=${dpi}`,
+      '-dAutoFilterColorImages=false',
+      '-dColorImageDownsampleType=/Bicubic',
+      '-sOutputFile=' + outputPath,
+      inputPath
+    ],
+    { timeout: 60000 }
+  );
+}
+
+function cleanTempDir(dir) {
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
-    }
-
-    const inputDir = '/tmp/convert_' + uuidv4();
-    fs.mkdirSync(inputDir, { recursive: true });
-    const ext = path.extname(req.file.originalname).toLowerCase();
-    const inputPath = path.join(inputDir, 'source' + ext);
-    fs.renameSync(req.file.path, inputPath);
-
-    const outputPath = convertWithLibreOffice(inputPath, 'pdf');
-
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${req.file.originalname.replace(/\.[^.]+$/, '.pdf')}"`);
-
-    const fileStream = fs.createReadStream(outputPath);
-    fileStream.pipe(res);
-
-    fileStream.on('end', () => {
-      fs.rmSync(inputDir, { recursive: true, force: true });
-    });
-  } catch (error) {
-    console.error('Conversion error:', error);
-    res.status(500).json({ error: 'Conversion failed: ' + error.message });
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch (e) {
+    /* best effort */
   }
-});
+}
 
-app.post('/convert/pdf-to-word', upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
+function tempSweep() {
+  const cutoff = Date.now() - 3600 * 1000;
+  for (const prefix of ['convert_', 'compress_']) {
+    try {
+      for (const entry of fs.readdirSync('/tmp')) {
+        if (!entry.startsWith(prefix)) continue;
+        const full = path.join('/tmp', entry);
+        try {
+          if (fs.statSync(full).mtimeMs < cutoff) cleanTempDir(full);
+        } catch (e) {
+          /* entry vanished, ignore */
+        }
+      }
+    } catch (e) {
+      /* /tmp unreadable, ignore */
     }
-
-    const inputDir = '/tmp/convert_' + uuidv4();
-    fs.mkdirSync(inputDir, { recursive: true });
-    const inputPath = path.join(inputDir, 'source.pdf');
-    fs.renameSync(req.file.path, inputPath);
-
-    const outputPath = convertWithLibreOffice(inputPath, 'docx');
-
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
-    res.setHeader('Content-Disposition', `attachment; filename="${req.file.originalname.replace(/\.[^.]+$/, '.docx')}"`);
-
-    const fileStream = fs.createReadStream(outputPath);
-    fileStream.pipe(res);
-
-    fileStream.on('end', () => {
-      fs.rmSync(inputDir, { recursive: true, force: true });
-    });
-  } catch (error) {
-    console.error('Conversion error:', error);
-    res.status(500).json({ error: 'Conversion failed: ' + error.message });
   }
-});
+}
+setInterval(tempSweep, 30 * 60 * 1000).unref();
+tempSweep();
 
-app.post('/convert/excel-to-pdf', upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
-    }
-
-    const inputDir = '/tmp/convert_' + uuidv4();
-    fs.mkdirSync(inputDir, { recursive: true });
-    const ext = path.extname(req.file.originalname).toLowerCase();
-    const inputPath = path.join(inputDir, 'source' + ext);
-    fs.renameSync(req.file.path, inputPath);
-
-    const outputPath = convertWithLibreOffice(inputPath, 'pdf');
-
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${req.file.originalname.replace(/\.[^.]+$/, '.pdf')}"`);
-
-    const fileStream = fs.createReadStream(outputPath);
-    fileStream.pipe(res);
-
-    fileStream.on('end', () => {
-      fs.rmSync(inputDir, { recursive: true, force: true });
-    });
-  } catch (error) {
-    console.error('Conversion error:', error);
-    res.status(500).json({ error: 'Conversion failed: ' + error.message });
+function requireUploadedFile(req, res) {
+  if (!req.file) {
+    res.status(400).json({ error: 'No file uploaded' });
+    return null;
   }
-});
+  return req.file;
+}
 
-app.post('/convert/ppt-to-pdf', upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
-    }
+function sendFileResponse(res, inputDir, filePath, contentType, downloadName) {
+  res.setHeader('Content-Type', contentType);
+  res.setHeader('Content-Disposition', 'attachment; filename="' + downloadName + '"');
+  const fileStream = fs.createReadStream(filePath);
+  fileStream.pipe(res);
+  const cleanup = () => cleanTempDir(inputDir);
+  res.on('finish', cleanup);
+  res.on('close', cleanup);
+}
 
-    const inputDir = '/tmp/convert_' + uuidv4();
-    fs.mkdirSync(inputDir, { recursive: true });
-    const ext = path.extname(req.file.originalname).toLowerCase();
-    const inputPath = path.join(inputDir, 'source' + ext);
-    fs.renameSync(req.file.path, inputPath);
+// --- document conversions ---
+function makeConvertRoute(outputFormat, defaultExt, contentType) {
+  return (req, res) => {
+    const file = requireUploadedFile(req, res);
+    if (!file) return;
 
-    const outputPath = convertWithLibreOffice(inputPath, 'pdf');
-
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="${req.file.originalname.replace(/\.[^.]+$/, '.pdf')}"`);
-
-    const fileStream = fs.createReadStream(outputPath);
-    fileStream.pipe(res);
-
-    fileStream.on('end', () => {
-      fs.rmSync(inputDir, { recursive: true, force: true });
+    runLimited(async () => {
+      const inputDir = '/tmp/convert_' + uuidv4();
+      fs.mkdirSync(inputDir, { recursive: true });
+      const ext = (path.extname(file.originalname) || defaultExt).toLowerCase();
+      const inputPath = path.join(inputDir, 'source' + ext);
+      fs.renameSync(file.path, inputPath);
+      try {
+        const outputPath = await runLibreOffice(inputPath, outputFormat);
+        const stem = safeFilename(path.basename(file.originalname, path.extname(file.originalname)), 'document');
+        const downloadName = stem + (outputFormat === 'docx' ? '.docx' : '.pdf');
+        sendFileResponse(res, inputDir, outputPath, contentType, downloadName);
+      } catch (error) {
+        cleanTempDir(inputDir);
+        console.error('Conversion error:', error);
+        if (!res.headersSent) res.status(500).json({ error: 'Conversion failed' });
+        else res.end();
+      }
+    }).catch(() => {
+      if (!res.headersSent) res.status(500).json({ error: 'Conversion failed' });
+      else res.end();
     });
-  } catch (error) {
-    console.error('Conversion error:', error);
-    res.status(500).json({ error: 'Conversion failed: ' + error.message });
-  }
-});
+  };
+}
 
-app.post('/compress-pdf', upload.single('file'), async (req, res) => {
-  let inputDir = null;
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
-    }
+app.post('/convert/word-to-pdf', rateLimit, upload.single('file'), makeConvertRoute('pdf', '.docx', 'document.pdf', 'application/pdf'));
+app.post('/convert/pdf-to-word', rateLimit, upload.single('file'), makeConvertRoute('docx', '.pdf', 'document.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'));
+app.post('/convert/excel-to-pdf', rateLimit, upload.single('file'), makeConvertRoute('pdf', '.xlsx', 'document.pdf', 'application/pdf'));
+app.post('/convert/ppt-to-pdf', rateLimit, upload.single('file'), makeConvertRoute('pdf', '.pptx', 'document.pdf', 'application/pdf'));
 
-    const targetSizeKB = parseInt(req.body.targetSize) || 500;
+// --- PDF compression with target size ---
+app.post('/compress-pdf', rateLimit, upload.single('file'), (req, res) => {
+  const file = requireUploadedFile(req, res);
+  if (!file) return;
+
+  runLimited(async () => {
+    const targetSizeKB = parseInt(req.body.targetSize, 10) || 500;
     const targetBytes = targetSizeKB * 1024;
-    inputDir = '/tmp/compress_' + uuidv4();
+    const inputDir = '/tmp/compress_' + uuidv4();
     fs.mkdirSync(inputDir, { recursive: true });
     const inputPath = path.join(inputDir, 'input.pdf');
     const outputPath = path.join(inputDir, 'output.pdf');
-    
-    fs.renameSync(req.file.path, inputPath);
+    fs.renameSync(file.path, inputPath);
 
-    const originalSize = fs.statSync(inputPath).size;
+    try {
+      const originalSize = fs.statSync(inputPath).size;
 
-    if (originalSize <= targetBytes) {
-      res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Disposition', `attachment; filename="compressed.pdf"`);
-      fs.createReadStream(inputPath).pipe(res);
-      res.on('finish', () => { if (inputDir) fs.rmSync(inputDir, { recursive: true, force: true }); });
-      return;
-    }
-
-    const resolutions = [200, 150, 100, 72, 50, 30];
-    let bestPath = null;
-    let bestSize = Infinity;
-
-    for (const dpi of resolutions) {
-      const attemptOutput = path.join(inputDir, 'attempt_' + dpi + '.pdf');
-      const cmd = `gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dNOPAUSE -dBATCH -dQUIET ` +
-        `-dDownsampleColorImages=true -dDownsampleGrayImages=true -dDownsampleMonoImages=true ` +
-        `-dColorImageResolution=${dpi} -dGrayImageResolution=${dpi} -dMonoImageResolution=${dpi} ` +
-        `-dAutoFilterColorImages=false -dColorImageDownsampleType=/Bicubic ` +
-        `-sOutputFile="${attemptOutput}" "${inputPath}"`;
-      
-      try {
-        execSync(cmd, { timeout: 60000 });
-      } catch (e) {
-        continue;
+      if (originalSize <= targetBytes) {
+        sendFileResponse(res, inputDir, inputPath, 'application/pdf', 'compressed.pdf');
+        return;
       }
 
-      if (!fs.existsSync(attemptOutput)) continue;
+      const resolutions = [200, 150, 100, 72, 50, 30];
+      let bestPath = null;
+      let bestSize = Infinity;
 
-      const attemptSize = fs.statSync(attemptOutput).size;
+      for (const dpi of resolutions) {
+        const attemptOutput = path.join(inputDir, 'attempt_' + dpi + '.pdf');
+        try {
+          await runGhostscript(inputPath, attemptOutput, dpi);
+        } catch (e) {
+          continue;
+        }
 
-      if (attemptSize < bestSize) {
-        bestSize = attemptSize;
-        bestPath = attemptOutput;
+        if (!fs.existsSync(attemptOutput)) continue;
+
+        const attemptSize = fs.statSync(attemptOutput).size;
+
+        if (attemptSize < bestSize) {
+          bestSize = attemptSize;
+          bestPath = attemptOutput;
+        }
+
+        if (attemptSize <= targetBytes) break;
       }
 
-      if (attemptSize <= targetBytes) break;
+      if (!bestPath) {
+        throw new Error('Compression failed');
+      }
+
+      if (bestPath !== outputPath) {
+        fs.copyFileSync(bestPath, outputPath);
+      }
+
+      sendFileResponse(res, inputDir, outputPath, 'application/pdf', 'compressed.pdf');
+    } catch (error) {
+      cleanTempDir(inputDir);
+      console.error('Compression error:', error);
+      if (!res.headersSent) res.status(500).json({ error: 'Compression failed' });
+      else res.end();
     }
-
-    if (!bestPath) {
-      throw new Error('Compression failed');
-    }
-
-    if (bestPath !== outputPath) {
-      fs.copyFileSync(bestPath, outputPath);
-    }
-
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename="compressed.pdf"`);
-
-    const fileStream = fs.createReadStream(outputPath);
-    fileStream.pipe(res);
-
-    fileStream.on('end', () => {
-      if (inputDir) fs.rmSync(inputDir, { recursive: true, force: true });
-    });
-
-    fileStream.on('error', () => {
-      if (inputDir) fs.rmSync(inputDir, { recursive: true, force: true });
-    });
-  } catch (error) {
-    console.error('Compression error:', error);
-    res.status(500).json({ error: 'Compression failed: ' + error.message });
-    if (inputDir) fs.rmSync(inputDir, { recursive: true, force: true });
-  }
+  }).catch(() => {
+    if (!res.headersSent) res.status(500).json({ error: 'Compression failed' });
+    else res.end();
+  });
 });
 
 app.listen(PORT, () => {
