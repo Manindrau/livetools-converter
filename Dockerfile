@@ -11,8 +11,9 @@ RUN apt-get update && apt-get install -y \
     ghostscript \
     python3 \
     python3-pip \
-    && pip3 install pdf2docx \
     && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install pdf2docx PyMuPDF==1.24.3 python-docx
 
 WORKDIR /app
 
