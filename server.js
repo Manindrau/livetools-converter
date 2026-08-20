@@ -256,28 +256,44 @@ app.post('/compress-pdf', rateLimit, upload.single('file'), (req, res) => {
         return;
       }
 
-      const resolutions = [200, 150, 100, 72, 50, 30];
+      let low = 30;
+      let high = 200;
       let bestPath = null;
       let bestSize = Infinity;
+      let bestDpi = low;
+      let attempts = 0;
+      const maxAttempts = 5;
 
-      for (const dpi of resolutions) {
-        const attemptOutput = path.join(inputDir, 'attempt_' + dpi + '.pdf');
+      while (low <= high && attempts < maxAttempts) {
+        const mid = Math.round((low + high) / 2);
+        attempts++;
+
+        const attemptOutput = path.join(inputDir, 'attempt_' + mid + '.pdf');
         try {
-          await runGhostscript(inputPath, attemptOutput, dpi);
+          await runGhostscript(inputPath, attemptOutput, mid);
         } catch (e) {
+          high = mid - 1;
           continue;
         }
 
-        if (!fs.existsSync(attemptOutput)) continue;
+        if (!fs.existsSync(attemptOutput)) {
+          high = mid - 1;
+          continue;
+        }
 
         const attemptSize = fs.statSync(attemptOutput).size;
 
         if (attemptSize < bestSize) {
           bestSize = attemptSize;
           bestPath = attemptOutput;
+          bestDpi = mid;
         }
 
-        if (attemptSize <= targetBytes) break;
+        if (attemptSize <= targetBytes) {
+          low = mid + 1;
+        } else {
+          high = mid - 1;
+        }
       }
 
       if (!bestPath) {
