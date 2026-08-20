@@ -94,6 +94,31 @@ function runLibreOffice(inputPath, outputFormat) {
   });
 }
 
+function runPdf2Docx(inputPath) {
+  const outputDir = path.dirname(inputPath);
+  const outputPath = path.join(outputDir, 'output.docx');
+  return execFileAsync(
+    'python3',
+    ['-c', `
+import sys
+from pdf2docx import Converter
+from docx import Document
+from docx.shared import Pt
+
+cv = Converter(sys.argv[1])
+cv.convert(sys.argv[2])
+cv.close()
+
+doc = Document(sys.argv[2])
+for para in doc.paragraphs:
+    for run in para.runs:
+        run.font.size = Pt(8)
+doc.save(sys.argv[2])
+`, inputPath, outputPath],
+    { timeout: 120000 }
+  ).then(() => outputPath);
+}
+
 function runGhostscript(inputPath, outputPath, dpi) {
   return execFileAsync(
     'gs',
@@ -156,9 +181,21 @@ function requireUploadedFile(req, res) {
 }
 
 function sendFileResponse(res, inputDir, filePath, contentType, downloadName) {
+  if (!fs.existsSync(filePath)) {
+    cleanTempDir(inputDir);
+    if (!res.headersSent) res.status(500).json({ error: 'Conversion failed: output file not created' });
+    else res.end();
+    return;
+  }
   res.setHeader('Content-Type', contentType);
   res.setHeader('Content-Disposition', 'attachment; filename="' + downloadName + '"');
   const fileStream = fs.createReadStream(filePath);
+  fileStream.on('error', (err) => {
+    console.error('FileStream error:', err);
+    cleanTempDir(inputDir);
+    if (!res.headersSent) res.status(500).json({ error: 'Conversion failed' });
+    else res.end();
+  });
   fileStream.pipe(res);
   const cleanup = () => cleanTempDir(inputDir);
   res.on('finish', cleanup);
@@ -178,7 +215,12 @@ function makeConvertRoute(outputFormat, defaultExt, contentType) {
       const inputPath = path.join(inputDir, 'source' + ext);
       fs.renameSync(file.path, inputPath);
       try {
-        const outputPath = await runLibreOffice(inputPath, outputFormat);
+        let outputPath;
+        if (outputFormat === 'docx') {
+          outputPath = await runPdf2Docx(inputPath);
+        } else {
+          outputPath = await runLibreOffice(inputPath, outputFormat);
+        }
         const stem = safeFilename(path.basename(file.originalname, path.extname(file.originalname)), 'document');
         const downloadName = stem + (outputFormat === 'docx' ? '.docx' : '.pdf');
         sendFileResponse(res, inputDir, outputPath, contentType, downloadName);
@@ -195,10 +237,10 @@ function makeConvertRoute(outputFormat, defaultExt, contentType) {
   };
 }
 
-app.post('/convert/word-to-pdf', rateLimit, upload.single('file'), makeConvertRoute('pdf', '.docx', 'document.pdf', 'application/pdf'));
-app.post('/convert/pdf-to-word', rateLimit, upload.single('file'), makeConvertRoute('docx', '.pdf', 'document.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'));
-app.post('/convert/excel-to-pdf', rateLimit, upload.single('file'), makeConvertRoute('pdf', '.xlsx', 'document.pdf', 'application/pdf'));
-app.post('/convert/ppt-to-pdf', rateLimit, upload.single('file'), makeConvertRoute('pdf', '.pptx', 'document.pdf', 'application/pdf'));
+app.post('/convert/word-to-pdf', rateLimit, upload.single('file'), makeConvertRoute('pdf', '.docx', 'application/pdf'));
+app.post('/convert/pdf-to-word', rateLimit, upload.single('file'), makeConvertRoute('docx', '.pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'));
+app.post('/convert/excel-to-pdf', rateLimit, upload.single('file'), makeConvertRoute('pdf', '.xlsx', 'application/pdf'));
+app.post('/convert/ppt-to-pdf', rateLimit, upload.single('file'), makeConvertRoute('pdf', '.pptx', 'application/pdf'));
 
 // --- PDF compression with target size ---
 app.post('/compress-pdf', rateLimit, upload.single('file'), (req, res) => {

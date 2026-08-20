@@ -5,9 +5,13 @@ RUN apt-get update && apt-get install -y \
     libreoffice-writer \
     libreoffice-calc \
     libreoffice-impress \
+    libreoffice-draw \
     fonts-liberation \
     fonts-dejavu-core \
     ghostscript \
+    python3 \
+    python3-pip \
+    && pip3 install pdf2docx \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
