@@ -113,6 +113,12 @@ doc = Document(sys.argv[2])
 for para in doc.paragraphs:
     for run in para.runs:
         run.font.size = Pt(8)
+for table in doc.tables:
+    for row in table.rows:
+        for cell in row.cells:
+            for para in cell.paragraphs:
+                for run in para.runs:
+                    run.font.size = Pt(8)
 doc.save(sys.argv[2])
 `, inputPath, outputPath],
     { timeout: 120000 }
