@@ -12,13 +12,46 @@ const execFileAsync = promisify(execFile);
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
-app.use(express.json());
+// --- shutdown & request-accounting state ---
+let shuttingDown = false;
+let pendingRequests = 0;
+let multerActive = 0;
+let serverClosed = false;
+let watchdog = null;
+let httpServer = null;
+const activePaths = new Set();
 
-const upload = multer({
-  dest: '/tmp/uploads',
-  limits: { fileSize: 50 * 1024 * 1024 }
+app.use(cors());
+
+// --- request accounting: FIRST middleware, before any body parser (CORS above stays sync & first) ---
+app.use((req, res, next) => {
+  pendingRequests += 1;
+  let decremented = false;
+  const done = () => {
+    if (decremented) return;
+    decremented = true;
+    pendingRequests -= 1;
+    maybeShutdownExit('request-close');
+  };
+  res.on('close', done);
+
+  if (shuttingDown) {
+    // reject before Multer/express.json ever engage; Connection: close => socket not reusable with unread body
+    try { res.set('Connection', 'close'); } catch (e) { /* ignore */ }
+    if (!res.destroyed && !res.writableEnded) {
+      if (!res.headersSent) {
+        try { res.status(500).json({ error: 'Conversion failed' }); } catch (e) { /* ignore */ }
+      } else {
+        try { res.end(); } catch (e) { /* ignore */ }
+      }
+    }
+    try { if (typeof req.resume === 'function') req.resume(); } catch (e) { /* ignore */ }
+    return;
+  }
+  next();
 });
+
+app.use(express.json());
 
 // --- minimal in-memory rate limiter (requests per IP per minute) ---
 const RATE_LIMIT = 60;
@@ -51,12 +84,17 @@ let activeJobs = 0;
 
 function runLimited(fn) {
   return new Promise((resolve, reject) => {
+    if (shuttingDown) {
+      reject(new Error('shutdown'));
+      return;
+    }
     jobQueue.push({ fn, resolve, reject });
     pumpQueue();
   });
 }
 
 function pumpQueue() {
+  if (shuttingDown) return;
   if (activeJobs >= MAX_CONCURRENT || jobQueue.length === 0) return;
   const { fn, resolve, reject } = jobQueue.shift();
   activeJobs += 1;
@@ -66,13 +104,210 @@ function pumpQueue() {
     .finally(() => {
       activeJobs -= 1;
       pumpQueue();
+      maybeShutdownExit('job-finished');
     });
 }
 
+function drainJobQueue() {
+  while (jobQueue.length) {
+    const { reject } = jobQueue.shift();
+    try { reject(new Error('shutdown')); } catch (e) { /* ignore */ }
+  }
+}
+
+// --- tracked Multer: multerActive covers body writes AND abort/partial removal until Multer's own next() ---
+const upload = multer({
+  dest: '/tmp/uploads',
+  limits: { fileSize: 50 * 1024 * 1024 }
+});
+
+function trackedUpload(field) {
+  const inner = upload.single(field);
+  return (req, res, next) => {
+    multerActive += 1;
+    let called = false;
+    const cb = (err) => {
+      if (called) return;
+      called = true;
+      multerActive -= 1;
+      maybeShutdownExit('multer-done');
+      next(err);
+    };
+    try {
+      inner(req, res, cb);
+    } catch (e) {
+      cb(e);
+    }
+  };
+}
+
 // --- helpers ---
+function sendLegacy500(res, msg) {
+  try {
+    if (res.destroyed) return;
+    if (res.writableEnded) return;
+    if (res.headersSent) {
+      if (res.writable) { try { res.end(); } catch (e) { /* ignore */ } }
+      return;
+    }
+    if (!res.writable) return;
+    res.status(500).json({ error: msg });
+  } catch (e) { /* never throws */ }
+}
+
+function cleanTempDir(dir) {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+    return true;
+  } catch (e) {
+    console.error('[cleanup] FAILED path=' + dir + ' code=' + (e && e.code));
+    return false;
+  }
+}
+
+// --- request-scoped cleanup (idempotent; activePaths protects in-flight files from the sweep) ---
+function attachRequestCleanup(req, res) {
+  const state = { paths: [], dirs: [], phase: 'received', aborted: false, cleaned: false };
+  if (req.file && req.file.path) {
+    state.paths.push(req.file.path);
+    activePaths.add(req.file.path);
+  }
+  res.on('close', () => {
+    state.aborted = !res.writableEnded;
+    if (state.phase !== 'processing' && state.phase !== 'responding') {
+      cleanupOnce();
+    }
+  });
+  function cleanupOnce() {
+    if (state.cleaned) return;
+    state.cleaned = true;
+    for (const p of state.paths.concat(state.dirs)) {
+      activePaths.delete(p);
+      cleanTempDir(p);
+    }
+  }
+  return { state, cleanupOnce };
+}
+
+// --- temp sweep: 3 scopes, 1h age gate, activePaths skip, per-item error capture ---
+function tempSweep() {
+  const cutoff = Date.now() - 3600 * 1000;
+  let dirsRemoved = 0;
+  let uploadsRemoved = 0;
+  let errors = 0;
+  for (const prefix of ['convert_', 'compress_']) {
+    try {
+      for (const entry of fs.readdirSync('/tmp')) {
+        if (!entry.startsWith(prefix)) continue;
+        const full = path.join('/tmp', entry);
+        try {
+          if (activePaths.has(full)) continue;
+          if (fs.statSync(full).mtimeMs < cutoff) {
+            if (cleanTempDir(full)) dirsRemoved += 1;
+            else errors += 1;
+          }
+        } catch (e) { /* entry vanished, ignore */ }
+      }
+    } catch (e) { /* /tmp unreadable, ignore */ }
+  }
+  // Uploads scope: skip entirely while any Multer request is in flight (multerActive > 0).
+  // A file currently being written — or a stalled partial that never reached
+  // attachRequestCleanup() — is not in activePaths yet; its mtime may exceed the age
+  // cutoff if the client stalls, so age alone cannot protect it. multerActive is
+  // incremented before Multer starts and decremented only in Multer's own callback
+  // (after writes/removal attempts complete), so this gate covers the whole window.
+  if (multerActive === 0) {
+    try {
+      for (const entry of fs.readdirSync('/tmp/uploads')) {
+        const full = path.join('/tmp/uploads', entry);
+        try {
+          if (activePaths.has(full)) continue;
+          if (fs.statSync(full).mtimeMs < cutoff) {
+            if (cleanTempDir(full)) uploadsRemoved += 1;
+            else errors += 1;
+          }
+        } catch (e) { /* entry vanished, ignore */ }
+      }
+    } catch (e) { /* /tmp/uploads absent, ignore */ }
+  }
+  if (dirsRemoved > 0 || uploadsRemoved > 0 || errors > 0) {
+    console.log('[cleanup] sweep uploads=' + uploadsRemoved + ' dirs=' + dirsRemoved + ' errors=' + errors);
+  }
+}
+setInterval(tempSweep, 30 * 60 * 1000).unref();
+tempSweep();
+
+// --- shutdown: five graceful gates + 6s watchdog force valve ---
+function maybeShutdownExit(reason) {
+  if (!shuttingDown) return;
+  if (httpServer && typeof httpServer.closeIdleConnections === 'function') {
+    try { httpServer.closeIdleConnections(); } catch (e) { /* ignore */ }
+  }
+  if (
+    pendingRequests === 0 &&
+    multerActive === 0 &&
+    activeJobs === 0 &&
+    jobQueue.length === 0 &&
+    serverClosed === true
+  ) {
+    console.log('[shutdown] exit: all counters zero; serverClosed=true (' + reason + ')');
+    try { tempSweep(); } catch (e) { /* ignore */ }
+    process.exit(0);
+  }
+}
+
+function beginShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(
+    '[shutdown] begin signal=' + signal +
+    ' pending=' + pendingRequests +
+    ' multer=' + multerActive +
+    ' jobs=' + activeJobs +
+    ' queued=' + jobQueue.length +
+    ' serverClosed=' + serverClosed
+  );
+  if (httpServer) {
+    httpServer.close(() => {
+      serverClosed = true;
+      maybeShutdownExit('server-closed');
+    });
+    if (typeof httpServer.closeIdleConnections === 'function') {
+      try { httpServer.closeIdleConnections(); } catch (e) { /* ignore */ }
+    }
+  } else {
+    serverClosed = true;
+  }
+  drainJobQueue();
+  maybeShutdownExit('signal');
+  watchdog = setTimeout(() => {
+    console.warn(
+      '[shutdown] watchdog fired; forcing exit pending=' + pendingRequests +
+      ' multer=' + multerActive +
+      ' jobs=' + activeJobs +
+      ' queued=' + jobQueue.length +
+      ' serverClosed=' + serverClosed
+    );
+    try { tempSweep(); } catch (e) { /* ignore */ }
+    process.exit(0);
+  }, 6000);
+  if (watchdog && typeof watchdog.unref === 'function') watchdog.unref();
+}
+
+process.on('SIGTERM', () => beginShutdown('SIGTERM'));
+process.on('SIGINT', () => beginShutdown('SIGINT'));
+
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
+
+function requireUploadedFile(req, res) {
+  if (!req.file) {
+    res.status(400).json({ error: 'No file uploaded' });
+    return null;
+  }
+  return req.file;
+}
 
 function safeFilename(name, fallback) {
   // strip anything that could break the Content-Disposition header
@@ -135,74 +370,175 @@ function runGhostscript(inputPath, outputPath, dpi) {
   );
 }
 
-function cleanTempDir(dir) {
-  try {
-    fs.rmSync(dir, { recursive: true, force: true });
-  } catch (e) {
-    /* best effort */
-  }
-}
+// --- response streaming with actual-source-closure settlement ---
+function sendFileResponse(res, filePath, contentType, downloadName) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let outcome = null;
+    let sourceClosed = false;
+    let finishing = false;
+    let tornDown = false;
+    let fileStream = null;
+    let onStreamError = null;
+    let onFin = null;
+    let onClose = null;
+    let onResError = null;
+    let onSourceClose = null;
+    let warnTimer = null;
 
-function tempSweep() {
-  const cutoff = Date.now() - 3600 * 1000;
-  for (const prefix of ['convert_', 'compress_']) {
-    try {
-      for (const entry of fs.readdirSync('/tmp')) {
-        if (!entry.startsWith(prefix)) continue;
-        const full = path.join('/tmp', entry);
-        try {
-          if (fs.statSync(full).mtimeMs < cutoff) cleanTempDir(full);
-        } catch (e) {
-          /* entry vanished, ignore */
-        }
-      }
-    } catch (e) {
-      /* /tmp unreadable, ignore */
+    function removeOurListeners() {
+      if (fileStream && onStreamError) fileStream.removeListener('error', onStreamError);
+      if (fileStream && onSourceClose) fileStream.removeListener('close', onSourceClose);
+      if (onFin) res.removeListener('finish', onFin);
+      if (onClose) res.removeListener('close', onClose);
+      if (onResError) res.removeListener('error', onResError);
+      if (warnTimer) { clearInterval(warnTimer); warnTimer = null; }
     }
-  }
-}
-setInterval(tempSweep, 30 * 60 * 1000).unref();
-tempSweep();
 
-function requireUploadedFile(req, res) {
-  if (!req.file) {
-    res.status(400).json({ error: 'No file uploaded' });
-    return null;
-  }
-  return req.file;
-}
+    function tryFinalize() {
+      if (settled) return;
+      if (!fileStream) {
+        settled = true;
+        removeOurListeners();
+        resolve(outcome);
+        return;
+      }
+      if (!sourceClosed) return;
+      settled = true;
+      removeOurListeners();
+      resolve(outcome);
+    }
 
-function sendFileResponse(res, inputDir, filePath, contentType, downloadName) {
-  if (!fs.existsSync(filePath)) {
-    cleanTempDir(inputDir);
-    if (!res.headersSent) res.status(500).json({ error: 'Conversion failed: output file not created' });
-    else res.end();
-    return;
-  }
-  res.setHeader('Content-Type', contentType);
-  res.setHeader('Content-Disposition', 'attachment; filename="' + downloadName + '"');
-  const fileStream = fs.createReadStream(filePath);
-  fileStream.on('error', (err) => {
-    console.error('FileStream error:', err);
-    cleanTempDir(inputDir);
-    if (!res.headersSent) res.status(500).json({ error: 'Conversion failed' });
-    else res.end();
+    function armSourceWait() {
+      if (!fileStream) { sourceClosed = true; tryFinalize(); return; }
+      if (!onSourceClose) {
+        onSourceClose = () => {
+          sourceClosed = true;
+          if (warnTimer) { clearInterval(warnTimer); warnTimer = null; }
+          tryFinalize();
+        };
+        fileStream.once('close', onSourceClose);
+      }
+      if (fileStream.closed === true) {
+        if (warnTimer) { clearInterval(warnTimer); warnTimer = null; }
+        sourceClosed = true;
+        tryFinalize();
+        return;
+      }
+      if (!warnTimer) {
+        warnTimer = setInterval(() => {
+          console.warn('[stream] warn: waiting for source close');
+        }, 5000);
+        if (warnTimer && typeof warnTimer.unref === 'function') warnTimer.unref();
+      }
+    }
+
+    function teardownSource() {
+      if (tornDown || !fileStream) return;
+      tornDown = true;
+      try { fileStream.unpipe(res); } catch (e) { /* ignore */ }
+      if (!fileStream.destroyed) fileStream.destroy();
+      armSourceWait();
+    }
+
+    function send500(msg) {
+      try {
+        if (res.destroyed) return;
+        if (res.writableEnded) return;
+        if (res.headersSent) {
+          if (res.writable) { try { res.end(); } catch (e) { /* ignore */ } }
+          return;
+        }
+        if (!res.writable) return;
+        res.status(500).json({ error: msg });
+      } catch (e) {
+        try { console.error('FileStream error:', e); } catch (x) { /* ignore */ }
+      }
+    }
+
+    function handleFatal(o, msg, logErr) {
+      try {
+        if (logErr !== undefined) console.error('FileStream error:', logErr);
+        if (outcome === null) outcome = o;
+        send500(msg);
+      } finally {
+        teardownSource();
+        tryFinalize();
+      }
+    }
+
+    try {
+      if (!fs.existsSync(filePath)) {
+        outcome = 'missing';
+        send500('Conversion failed: output file not created');
+        tryFinalize();
+        return;
+      }
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Content-Disposition', 'attachment; filename="' + downloadName + '"');
+      fileStream = fs.createReadStream(filePath);
+      onStreamError = (err) => {
+        if (settled || tornDown) return;
+        handleFatal('stream-error', 'Conversion failed', err);
+      };
+      onResError = () => {
+        if (settled) return;
+        handleFatal('res-error', 'Conversion failed');
+      };
+      onFin = () => {
+        if (settled) return;
+        if (outcome === null) outcome = 'finished';
+        finishing = true;
+        teardownSource();
+        tryFinalize();
+      };
+      onClose = () => {
+        if (settled || finishing) return;
+        if (outcome === null) outcome = 'closed-before-finish';
+        teardownSource();
+        tryFinalize();
+      };
+      fileStream.on('error', onStreamError);
+      res.once('finish', onFin);
+      res.once('close', onClose);
+      res.on('error', onResError);
+      fileStream.pipe(res);
+    } catch (e) {
+      handleFatal('sync-throw', 'Conversion failed', e);
+    }
   });
-  fileStream.pipe(res);
-  const cleanup = () => cleanTempDir(inputDir);
-  res.on('finish', cleanup);
-  res.on('close', cleanup);
 }
 
 // --- document conversions ---
 function makeConvertRoute(outputFormat, defaultExt, contentType) {
   return (req, res) => {
-    const file = requireUploadedFile(req, res);
-    if (!file) return;
+    const { state, cleanupOnce } = attachRequestCleanup(req, res);
 
+    if (shuttingDown) {
+      sendLegacy500(res, 'Conversion failed');
+      cleanupOnce();
+      return;
+    }
+
+    const file = requireUploadedFile(req, res);
+    if (!file) {
+      cleanupOnce();
+      return;
+    }
+
+    state.phase = 'queued';
     runLimited(async () => {
+      if (res.destroyed || state.aborted || shuttingDown) {
+        console.error('[cleanup] skipped reason=abort');
+        sendLegacy500(res, 'Conversion failed');
+        cleanupOnce();
+        return;
+      }
+      state.phase = 'processing';
       const inputDir = '/tmp/convert_' + uuidv4();
       fs.mkdirSync(inputDir, { recursive: true });
+      state.dirs.push(inputDir);
+      activePaths.add(inputDir);
       const ext = (path.extname(file.originalname) || defaultExt).toLowerCase();
       const inputPath = path.join(inputDir, 'source' + ext);
       fs.renameSync(file.path, inputPath);
@@ -215,35 +551,63 @@ function makeConvertRoute(outputFormat, defaultExt, contentType) {
         }
         const stem = safeFilename(path.basename(file.originalname, path.extname(file.originalname)), 'document');
         const downloadName = stem + (outputFormat === 'docx' ? '.docx' : '.pdf');
-        sendFileResponse(res, inputDir, outputPath, contentType, downloadName);
+        if (res.destroyed || state.aborted) {
+          // client disconnected during processing — do not start streaming a dead response
+          console.error('[cleanup] skipped reason=abort');
+          return;
+        }
+        state.phase = 'responding';
+        await sendFileResponse(res, outputPath, contentType, downloadName);
       } catch (error) {
-        cleanTempDir(inputDir);
         console.error('Conversion error:', error);
-        if (!res.headersSent) res.status(500).json({ error: 'Conversion failed' });
-        else res.end();
+        sendLegacy500(res, 'Conversion failed');
+      } finally {
+        state.phase = 'settled';
+        cleanupOnce();
       }
     }).catch(() => {
-      if (!res.headersSent) res.status(500).json({ error: 'Conversion failed' });
-      else res.end();
+      sendLegacy500(res, 'Conversion failed');
+      cleanupOnce();
     });
   };
 }
 
-app.post('/convert/word-to-pdf', rateLimit, upload.single('file'), makeConvertRoute('pdf', '.docx', 'application/pdf'));
-app.post('/convert/pdf-to-word', rateLimit, upload.single('file'), makeConvertRoute('docx', '.pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'));
-app.post('/convert/excel-to-pdf', rateLimit, upload.single('file'), makeConvertRoute('pdf', '.xlsx', 'application/pdf'));
-app.post('/convert/ppt-to-pdf', rateLimit, upload.single('file'), makeConvertRoute('pdf', '.pptx', 'application/pdf'));
+app.post('/convert/word-to-pdf', rateLimit, trackedUpload('file'), makeConvertRoute('pdf', '.docx', 'application/pdf'));
+app.post('/convert/pdf-to-word', rateLimit, trackedUpload('file'), makeConvertRoute('docx', '.pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'));
+app.post('/convert/excel-to-pdf', rateLimit, trackedUpload('file'), makeConvertRoute('pdf', '.xlsx', 'application/pdf'));
+app.post('/convert/ppt-to-pdf', rateLimit, trackedUpload('file'), makeConvertRoute('pdf', '.pptx', 'application/pdf'));
 
 // --- PDF compression with target size ---
-app.post('/compress-pdf', rateLimit, upload.single('file'), (req, res) => {
-  const file = requireUploadedFile(req, res);
-  if (!file) return;
+app.post('/compress-pdf', rateLimit, trackedUpload('file'), (req, res) => {
+  const { state, cleanupOnce } = attachRequestCleanup(req, res);
 
+  if (shuttingDown) {
+    sendLegacy500(res, 'Compression failed');
+    cleanupOnce();
+    return;
+  }
+
+  const file = requireUploadedFile(req, res);
+  if (!file) {
+    cleanupOnce();
+    return;
+  }
+
+  state.phase = 'queued';
   runLimited(async () => {
+    if (res.destroyed || state.aborted || shuttingDown) {
+      console.error('[cleanup] skipped reason=abort');
+      sendLegacy500(res, 'Compression failed');
+      cleanupOnce();
+      return;
+    }
+    state.phase = 'processing';
     const targetSizeKB = parseInt(req.body.targetSize, 10) || 500;
     const targetBytes = targetSizeKB * 1024;
     const inputDir = '/tmp/compress_' + uuidv4();
     fs.mkdirSync(inputDir, { recursive: true });
+    state.dirs.push(inputDir);
+    activePaths.add(inputDir);
     const inputPath = path.join(inputDir, 'input.pdf');
     const outputPath = path.join(inputDir, 'output.pdf');
     fs.renameSync(file.path, inputPath);
@@ -252,7 +616,13 @@ app.post('/compress-pdf', rateLimit, upload.single('file'), (req, res) => {
       const originalSize = fs.statSync(inputPath).size;
 
       if (originalSize <= targetBytes) {
-        sendFileResponse(res, inputDir, inputPath, 'application/pdf', 'compressed.pdf');
+        if (res.destroyed || state.aborted) {
+          // client disconnected during processing — do not start streaming a dead response
+          console.error('[cleanup] skipped reason=abort');
+          return;
+        }
+        state.phase = 'responding';
+        await sendFileResponse(res, inputPath, 'application/pdf', 'compressed.pdf');
         return;
       }
 
@@ -260,13 +630,12 @@ app.post('/compress-pdf', rateLimit, upload.single('file'), (req, res) => {
       let high = 200;
       let bestPath = null;
       let bestSize = Infinity;
-      let bestDpi = low;
       let attempts = 0;
       const maxAttempts = 5;
 
       while (low <= high && attempts < maxAttempts) {
         const mid = Math.round((low + high) / 2);
-        attempts++;
+        attempts += 1;
 
         const attemptOutput = path.join(inputDir, 'attempt_' + mid + '.pdf');
         try {
@@ -286,7 +655,6 @@ app.post('/compress-pdf', rateLimit, upload.single('file'), (req, res) => {
         if (attemptSize < bestSize) {
           bestSize = attemptSize;
           bestPath = attemptOutput;
-          bestDpi = mid;
         }
 
         if (attemptSize <= targetBytes) {
@@ -304,19 +672,26 @@ app.post('/compress-pdf', rateLimit, upload.single('file'), (req, res) => {
         fs.copyFileSync(bestPath, outputPath);
       }
 
-      sendFileResponse(res, inputDir, outputPath, 'application/pdf', 'compressed.pdf');
+      if (res.destroyed || state.aborted) {
+        // client disconnected during processing — do not start streaming a dead response
+        console.error('[cleanup] skipped reason=abort');
+        return;
+      }
+      state.phase = 'responding';
+      await sendFileResponse(res, outputPath, 'application/pdf', 'compressed.pdf');
     } catch (error) {
-      cleanTempDir(inputDir);
       console.error('Compression error:', error);
-      if (!res.headersSent) res.status(500).json({ error: 'Compression failed' });
-      else res.end();
+      sendLegacy500(res, 'Compression failed');
+    } finally {
+      state.phase = 'settled';
+      cleanupOnce();
     }
   }).catch(() => {
-    if (!res.headersSent) res.status(500).json({ error: 'Compression failed' });
-    else res.end();
+    sendLegacy500(res, 'Compression failed');
+    cleanupOnce();
   });
 });
 
-app.listen(PORT, () => {
+httpServer = app.listen(PORT, () => {
   console.log(`Converter server running on port ${PORT}`);
 });
