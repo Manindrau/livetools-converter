@@ -18,11 +18,11 @@ if [ "$DOCKERFILE_CHANGED" = true ]; then
   docker stop converter 2>/dev/null || true
   docker rm converter 2>/dev/null || true
   docker build -t livetools-converter .
-  docker run -d --name converter --restart unless-stopped -p 3000:3000 livetools-converter
+  docker run -d --name converter --restart unless-stopped --stop-timeout=12 -p 3000:3000 livetools-converter
 else
   echo "No Dockerfile changes - copying server.js only..."
   docker cp ~/ToolWebsite/server.js converter:/app/server.js
-  docker restart converter
+  docker restart --timeout=12 converter
 fi
 
 echo "Deploy complete!"
