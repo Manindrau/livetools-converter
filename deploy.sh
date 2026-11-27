@@ -17,8 +17,8 @@ if [ "$DOCKERFILE_CHANGED" = true ]; then
   echo "Dockerfile changed or no container running - rebuilding image..."
   docker stop converter 2>/dev/null || true
   docker rm converter 2>/dev/null || true
-  docker build -t livetools-converter .
-  docker run -d --name converter --restart unless-stopped --stop-timeout=12 -p 3000:3000 livetools-converter
+  docker build --build-arg GIT_SHA=$(git rev-parse HEAD) -t livetools-converter .
+  docker run -d --name converter --restart unless-stopped --stop-timeout=12 -e GIT_SHA=$(git rev-parse HEAD) -p 3000:3000 livetools-converter
 else
   echo "No Dockerfile changes - copying server.js only..."
   docker cp ~/ToolWebsite/server.js converter:/app/server.js
