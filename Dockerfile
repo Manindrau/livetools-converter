@@ -1,5 +1,9 @@
 FROM node:18-bullseye
 
+# Deployed Git SHA baked at build time (passed via --build-arg GIT_SHA=$(git rev-parse HEAD))
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
+
 RUN apt-get update && apt-get install -y \
     libreoffice \
     libreoffice-writer \
