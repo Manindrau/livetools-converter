@@ -1,4 +1,4 @@
-FROM node:18-bullseye
+FROM node:24-bookworm
 
 # Deployed Git SHA baked at build time (passed via --build-arg GIT_SHA=$(git rev-parse HEAD))
 ARG GIT_SHA=unknown
@@ -17,12 +17,14 @@ RUN apt-get update && apt-get install -y \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install pdf2docx PyMuPDF==1.24.3 python-docx
+# Debian 12 marks the system interpreter externally managed (PEP 668);
+# --break-system-packages is required to install the runtime libraries.
+RUN pip3 install --no-cache-dir --break-system-packages pdf2docx PyMuPDF==1.24.3 python-docx
 
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm install --production
+RUN npm ci --omit=dev
 
 COPY . .
 
